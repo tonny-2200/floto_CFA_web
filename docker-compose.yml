@@ -1,0 +1,24 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - ./backend/generated_reports:/app/generated_reports
+    env_file:
+      - ./backend/.env
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    env_file:
+      - ./frontend/.env.local
+    environment:
+      FASTAPI_BASE_URL: http://backend:8000
+    depends_on:
+      - backend

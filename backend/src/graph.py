@@ -9,7 +9,7 @@ from langchain_openai import AzureChatOpenAI
 from dotenv import load_dotenv
 from prompts import (
     MAPPER_PROMPT_TEMPLATE,
-    AUDITOR_TEXT_PROMPT,
+    AUDITOR_TEXT_PROMPT_TEMPLATE,
     REPORTER_PROMPT_TEMPLATE,
 )
 
@@ -91,6 +91,147 @@ def _content_to_text(content) -> str:
         return "\n".join(parts).strip()
     return str(content)
 
+def _safe_json_parse(content):
+    """Parse model output JSON with common markdown fence cleanup."""
+    text = _content_to_text(content)
+    clean = text.replace("```json", "").replace("```", "").strip()
+    return json.loads(clean)
+
+def _normalize_funnel_map(data) -> Dict[str, List[str]]:
+    """Normalize mapper output to required lowercase stage keys."""
+    stage_keys = ["awareness", "exploration", "consideration", "conversion"]
+    if not isinstance(data, dict):
+        return {k: [] for k in stage_keys}
+
+    normalized = {}
+    for key in stage_keys:
+        value = data.get(key, [])
+        if isinstance(value, list):
+            normalized[key] = [str(v) for v in value if str(v).strip()]
+        elif isinstance(value, str) and value.strip():
+            normalized[key] = [value.strip()]
+        else:
+            normalized[key] = []
+    return normalized
+
+def _normalize_friction_points(data) -> List[Dict]:
+    """Normalize auditor output into list of structured friction points."""
+    if not isinstance(data, list):
+        return []
+
+    points = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        points.append(
+            {
+                "stage": str(item.get("stage", "Exploration")),
+                "severity": str(item.get("severity", "medium")).lower(),
+                "issue": str(item.get("issue", "")),
+                "evidence": str(item.get("evidence", "")),
+                "impact": str(item.get("impact", "")),
+            }
+        )
+    return points
+
+
+def _status_from_score(score: int) -> str:
+    """Map numeric score to UI status bands."""
+    if score >= 70:
+        return "good"
+    if score >= 40:
+        return "warning"
+    return "danger"
+
+
+def _compute_stage_score(
+    stage_key: str,
+    stage_label: str,
+    funnel_stages: Dict[str, List[str]],
+    friction_points: List[Dict],
+) -> int:
+    """
+    Deterministic stage score to reduce overly critical model swings.
+    Uses baseline + evidence coverage - friction penalties.
+    """
+    severity_penalty = {"low": 8, "medium": 18, "high": 30}
+    mapped_items = funnel_stages.get(stage_key, [])
+    stage_friction = [
+        p for p in friction_points
+        if str(p.get("stage", "")).strip().lower() == stage_label.lower()
+    ]
+
+    # Baseline: neutral score. Good pages should not start in danger.
+    score = 68
+
+    # Reward observable evidence in this stage.
+    if len(mapped_items) >= 3:
+        score += 8
+    elif len(mapped_items) >= 1:
+        score += 4
+    else:
+        score -= 10
+
+    # Penalize friction based on severity.
+    for point in stage_friction:
+        severity = str(point.get("severity", "medium")).lower()
+        score -= severity_penalty.get(severity, 18)
+
+    return max(0, min(100, int(round(score))))
+
+
+def _calibrate_report_scores(
+    final_report: Dict,
+    funnel_stages: Dict[str, List[str]],
+    friction_points: List[Dict],
+) -> Dict:
+    """
+    Blend LLM scores with deterministic stage signals so one bad LLM sample
+    does not classify healthy landing pages as critical.
+    """
+    canonical_stages = [
+        ("awareness", "Awareness"),
+        ("exploration", "Exploration"),
+        ("consideration", "Consideration"),
+        ("conversion", "Conversion"),
+    ]
+
+    stage_lookup = {}
+    for item in final_report.get("funnel_data", []):
+        if isinstance(item, dict):
+            key = str(item.get("stage", "")).strip().lower()
+            stage_lookup[key] = item
+
+    calibrated_funnel = []
+    for stage_key, stage_label in canonical_stages:
+        llm_item = stage_lookup.get(stage_label.lower(), {})
+        llm_score = _coerce_score(llm_item.get("value", 68), default=68)
+        deterministic_score = _compute_stage_score(
+            stage_key=stage_key,
+            stage_label=stage_label,
+            funnel_stages=funnel_stages,
+            friction_points=friction_points,
+        )
+
+        # Weighted blend favors model, but anchors with deterministic logic.
+        blended = int(round((0.6 * llm_score) + (0.4 * deterministic_score)))
+        blended = max(0, min(100, blended))
+        calibrated_funnel.append(
+            {
+                "stage": stage_label,
+                "value": blended,
+                "status": _status_from_score(blended),
+            }
+        )
+
+    overall = int(round(sum(item["value"] for item in calibrated_funnel) / len(calibrated_funnel)))
+
+    return {
+        "overall_score": overall,
+        "funnel_data": calibrated_funnel,
+        "top_recommendations": final_report.get("top_recommendations", ["No recommendations generated."])[:3],
+    }
+
 
 # 1. Define the State
 class GraphState(TypedDict):
@@ -120,54 +261,59 @@ llm_2 = ChatGoogleGenerativeAI(
 
 def mapper_node(state: GraphState):
     """Maps markdown content to Awareness, Exploration, Consideration, Conversion."""
-    prompt = MAPPER_PROMPT_TEMPLATE.format(markdown=state["markdown"])
+    prompt = MAPPER_PROMPT_TEMPLATE.format(
+        markdown=state["markdown"],
+        structured_elements=json.dumps(state.get("structured_elements", {}), ensure_ascii=False),
+    )
     response = llm.invoke([SystemMessage(content="You are a conversion strategist."), HumanMessage(content=prompt)])
-    # In a real app, use structured output parser. For now, simple JSON loading.
-    state['funnel_stages'] = response.content 
+    try:
+        parsed = _safe_json_parse(response.content)
+        state['funnel_stages'] = _normalize_funnel_map(parsed)
+    except Exception as e:
+        print(f"Mapper JSON Parsing Error: {e}")
+        state['funnel_stages'] = _normalize_funnel_map({})
     return state
 
 def auditor_node(state: GraphState):
     """Identifies friction points using both Text and Vision."""
+    text_prompt = AUDITOR_TEXT_PROMPT_TEMPLATE.format(
+        funnel_stages=json.dumps(state.get("funnel_stages", {}), ensure_ascii=False)
+    )
     # We send the screenshot as a base64 message for Vision analysis
     message = HumanMessage(
         content=[
-            {"type": "text", "text": AUDITOR_TEXT_PROMPT},
+            {"type": "text", "text": text_prompt},
             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{state['screenshot']}"}}
         ]
     )
     
     response = llm.invoke([message])
-    state['friction_points'] = response.content
+    try:
+        parsed = _safe_json_parse(response.content)
+        state['friction_points'] = _normalize_friction_points(parsed)
+    except Exception as e:
+        print(f"Auditor JSON Parsing Error: {e}")
+        state['friction_points'] = []
     return state
 
 def reporter_node(state: GraphState):
     """Synthesizes everything into a final structured dashboard JSON."""
-    prompt = f"""
-    Create a final Conversion Audit Report based on these findings:
-    Funnel Mapping: {state['funnel_stages']}
-    Friction Points: {state['friction_points']}
-    
-    Return ONLY a valid JSON object. Do not include markdown formatting.
-    Required keys: 
-    - overall_score (int 0-100)
-    - funnel_data (list of objects with 'stage', 'value', 'status')
-    - top_recommendations (list of 3 strings)
-    """
+    prompt = REPORTER_PROMPT_TEMPLATE.format(
+        funnel_stages=json.dumps(state.get("funnel_stages", {}), ensure_ascii=False),
+        friction_points=json.dumps(state.get("friction_points", []), ensure_ascii=False),
+        structured_elements=json.dumps(state.get("structured_elements", {}), ensure_ascii=False),
+    )
     
     response = llm.invoke([HumanMessage(content=prompt)])
-    content = response.content
-
-    # Safety Check: If content is somehow not a string, convert it
-    if not isinstance(content, str):
-        content = str(content)
 
     try:
-        # 1. Strip out markdown code blocks if the LLM included them
-        clean_json = content.replace("```json", "").replace("```", "").strip()
-        
-        # 2. Parse the string into a Python dict
-        parsed = json.loads(clean_json)
-        state['final_report'] = _normalize_final_report(parsed)
+        parsed = _safe_json_parse(response.content)
+        normalized = _normalize_final_report(parsed)
+        state['final_report'] = _calibrate_report_scores(
+            final_report=normalized,
+            funnel_stages=state.get("funnel_stages", {}),
+            friction_points=state.get("friction_points", []),
+        )
     except Exception as e:
         print(f"JSON Parsing Error: {e}")
         # Fallback: Create a basic report structure so the app doesn't crash

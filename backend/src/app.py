@@ -1,8 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-from typing import Dict, Any
+from pydantic import BaseModel
+from typing import Dict, Any, Optional
 import base64
+import os
 from generate_pdf import generate_audit_pdf, send_audit_email
 
 # Import your existing logic
@@ -22,10 +23,16 @@ app.add_middleware(
 # --- SCHEMAS ---
 class AuditRequest(BaseModel):
     url: str
+    send_email: bool = False
 
 class AuditResponse(BaseModel):
     status: str
     screenshot: str # Base64
+    report: Dict[str, Any]
+    email_sent: bool = False
+    email_message: Optional[str] = None
+
+class EmailReportRequest(BaseModel):
     report: Dict[str, Any]
 
 # --- ENDPOINTS ---
@@ -67,21 +74,42 @@ async def perform_audit(request: AuditRequest):
         print("Crawl successful. Running AI Audit...")
         report = await run_audit(crawl_data)
         
-        # Add the URL to the report so it appears in the PDF
+        # Add the URL to the report for optional PDF generation later
         report['url'] = request.url
+        email_sent = False
+        email_message = None
+        if request.send_email:
+            try:
+                pdf_path = os.path.join(os.getcwd(), "report.pdf")
+                generate_audit_pdf(report, pdf_path)
+                send_audit_email(pdf_path)
+                email_sent = True
+                email_message = "Report emailed successfully."
+            except Exception as email_error:
+                email_message = f"Audit completed, but email failed: {str(email_error)}"
 
-        path = r"C:\Users\tanma\OneDrive\Desktop\floto_project\backend\report.pdf"
-        generate_audit_pdf(report, path)
-        send_audit_email(path)
         # 3. Return the payload
         return {
             "status": "success",
             "screenshot": crawl_data['screenshot'],
-            "report": report
+            "report": report,
+            "email_sent": email_sent,
+            "email_message": email_message
         }
 
     except Exception as e:
         print(f"Error during audit: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/send-report")
+async def send_report(request: EmailReportRequest):
+    try:
+        path = os.path.join(os.getcwd(), "report.pdf")
+        generate_audit_pdf(request.report, path)
+        response = send_audit_email(path)
+        return {"status": "success", "email_response": response}
+    except Exception as e:
+        print(f"Error while sending report: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":

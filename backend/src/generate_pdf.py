@@ -1,4 +1,3 @@
-from fpdf import FPDF
 import resend
 import base64
 import os
@@ -6,6 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 resend.api_key = os.getenv("RESEND_KEY")
+HARDCODED_REPORT_EMAIL = "batmantanmay22@gmail.com"
 
 from fpdf import FPDF
 
@@ -76,6 +76,11 @@ def generate_audit_pdf(report_data: dict, output_path: str):
 
 
 def send_audit_email(pdf_path: str):
+    recipient = HARDCODED_REPORT_EMAIL
+
+    if not resend.api_key:
+        raise ValueError("RESEND_KEY is not configured.")
+
     # 1. Read and encode the PDF file
     with open(pdf_path, "rb") as f:
         pdf_content = f.read()
@@ -84,7 +89,7 @@ def send_audit_email(pdf_path: str):
     # 2. Send the email
     params = {
         "from": "onboarding@resend.dev",
-        "to": "batmantanmay22@gmail.com",
+        "to": recipient,
         "subject": "Your Conversion Audit Report is Ready",
         "html": """
             <h1>Audit Complete!</h1>
@@ -99,11 +104,7 @@ def send_audit_email(pdf_path: str):
         ]
     }
 
-    try:
-        response = resend.Emails.send(params)
-        print(f"Email sent successfully! ID: {response['id']}")
-        return response
-    except Exception as e:
-        print(f"Failed to send email: {e}")
-        return None
+    response = resend.Emails.send(params)
+    print(f"Email sent successfully!")
+    return response
 

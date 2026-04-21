@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import {
   AlertCircle,
   BarChart3,
@@ -44,9 +44,9 @@ type AuditResponse = {
   status: string;
   screenshot: string;
   report: AuditReport;
+  email_sent?: boolean;
+  email_message?: string | null;
 };
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL;
 
 /* ── premium blue color palette for chart bars ────────────── */
 
@@ -151,49 +151,13 @@ function ScoreRing({ score }: { score: number }) {
 
 /* ── Main page ────────────────────────────────────────────── */
 
-/* ── localStorage helpers ─────────────────────────────────── */
-
-const STORAGE_KEY_AUDIT = "cfa_audit_data";
-const STORAGE_KEY_URL = "cfa_audit_url";
-
-function loadFromStorage<T>(key: string, fallback: T): T {
-  if (typeof window === "undefined") return fallback;
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : fallback;
-  } catch {
-    return fallback;
-  }
-}
-
 export default function Home() {
   const [url, setUrl] = useState("https://www.notion.so");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [auditData, setAuditData] = useState<AuditResponse | null>(null);
-
-  // Load from localStorage after mount
-  useEffect(() => {
-    const storedUrl = loadFromStorage<string>(STORAGE_KEY_URL, "https://www.notion.so");
-    setUrl(storedUrl);
-    const storedAudit = loadFromStorage<AuditResponse | null>(STORAGE_KEY_AUDIT, null);
-    if (storedAudit) setAuditData(storedAudit);
-  }, []);
-
-  // Persist audit data & URL to localStorage whenever they change
-  useEffect(() => {
-    try {
-      if (auditData) {
-        localStorage.setItem(STORAGE_KEY_AUDIT, JSON.stringify(auditData));
-      }
-    } catch { /* quota exceeded – ignore */ }
-  }, [auditData]);
-
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY_URL, JSON.stringify(url));
-    } catch { /* ignore */ }
-  }, [url]);
+  const [sendEmail, setSendEmail] = useState(true);
+  const [reportMessage, setReportMessage] = useState<string | null>(null);
 
   const screenshotSrc = useMemo(() => {
     if (!auditData?.screenshot) return null;
@@ -203,14 +167,18 @@ export default function Home() {
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError(null);
+    setReportMessage(null);
+    if (sendEmail) {
+      setReportMessage("We will send you an email once the task is done and share the report.");
+    }
     setIsLoading(true);
     setAuditData(null);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/audit`, {
+      const response = await fetch("/api/audit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url, send_email: sendEmail }),
       });
 
       const payload = (await response.json()) as AuditResponse | { detail?: string };
@@ -221,6 +189,12 @@ export default function Home() {
       }
 
       setAuditData(payload as AuditResponse);
+      if (sendEmail) {
+        const auditPayload = payload as AuditResponse;
+        if (!auditPayload.email_sent && auditPayload.email_message) {
+          setError(auditPayload.email_message);
+        }
+      }
     } catch (submitError) {
       const message =
         submitError instanceof Error
@@ -272,7 +246,25 @@ export default function Home() {
             </div>
           </div>
 
-          <form onSubmit={handleSubmit} className="flex flex-col gap-3 md:flex-row">
+          <label className="mt-3 inline-flex items-center gap-3 text-sm font-medium text-[var(--foreground)]">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={sendEmail}
+              onClick={() => setSendEmail((prev) => !prev)}
+              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                sendEmail ? "bg-[var(--primary)]" : "bg-[var(--muted)]"
+              }`}
+            >
+              <span
+                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
+                  sendEmail ? "translate-x-5" : "translate-x-1"
+                }`}
+              />
+            </button>
+            Email the report to batmantanmay22@gmail.com after audit
+          </label>
+          <form onSubmit={handleSubmit} className="mt-3 flex flex-col gap-3 md:flex-row">
             <input
               id="audit-url-input"
               className="h-11 flex-1 rounded-xl border border-[var(--border)] bg-[var(--card)] px-4 text-sm font-medium text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)] transition-all duration-200 focus:border-[var(--primary)] focus:ring-2 focus:ring-[var(--primary)]/25"
@@ -306,6 +298,12 @@ export default function Home() {
             <div className="mt-4 flex items-start gap-2 rounded-xl border border-red-300/40 bg-red-50 px-4 py-3 text-sm text-red-700">
               <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
               <p>{error}</p>
+            </div>
+          )}
+          {reportMessage && (
+            <div className="mt-4 flex items-start gap-2 rounded-xl border border-emerald-300/40 bg-emerald-50 px-4 py-3 text-sm text-emerald-700">
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+              <p>{reportMessage}</p>
             </div>
           )}
         </section>

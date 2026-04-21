@@ -71,7 +71,7 @@ Core backend modules:
 
 ---
 
-## AI orchestration (technical but simple)
+## AI orchestration
 
 The AI logic is implemented as a **3-stage LangGraph pipeline** in `backend/src/graph.py`.
 
@@ -125,7 +125,6 @@ Output hardening:
 
 ### Model layer
 - Primary model in flow: Azure OpenAI via `AzureChatOpenAI` (`gpt-5-mini` deployment).
-- A Google model client is initialized but not currently used in the graph path.
 
 ### Why this orchestration is useful
 - Multi-step decomposition improves consistency versus one-shot prompts.
